@@ -1,0 +1,284 @@
+%
+% Spark reference architectures
+% Copyright (C) 2016 Jan Machacek
+%
+% This program is free software: you can redistribute it and/or modify
+% it under the terms of the GNU General Public License as published by
+% the Free Software Foundation, either version 3 of the License, or
+% (at your option) any later version.
+%
+% This program is distributed in the hope that it will be useful,
+% but WITHOUT ANY WARRANTY; without even the implied warranty of
+% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+% GNU General Public License for more details.
+%
+% You should have received a copy of the GNU General Public License
+% along with this program.  If not, see <http://www.gnu.org/licenses/>.
+%
+
+\documentclass[a4paper, 10 pt, conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{interval}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{siunitx}
+\usepackage{amsmath}
+
+\sisetup{load-configurations = abbreviations, binary-units = true}
+\intervalconfig {
+soft open fences ,
+separator symbol =; ,
+}
+
+\def\lstinlinex{\lstinline[basicstyle=\itshape,keywordstyle={}]}
+
+\newcommand{\fig}[3]{
+  \begin{figure}[h]
+    \begin{center}
+        \caption{#3}
+        \includegraphics[width=7cm,keepaspectratio]{#1}
+        \label{fig:#2}
+    \end{center}
+  \end{figure}
+}
+
+\title{Spark Reference Architecture \\ Sensor batch processing}
+
+\author{Jan Mach{\'a}\v{c}ek%$^{1}$% <-this % stops a space
+%\thanks{Supported by Cake Solutions Limited}% <-this % stops a space
+%\thanks{$^{1}$J. Machacek is the CTO at Cake Solutions, Houldsworth Mill, Houldsworth Street, Reddish, SK5 6DA, UK {\tt\small janm at cakesolutions.net}}%
+}
+
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+
+TODO
+
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+
+TODO
+
+\section{Reference implementation}
+
+This architecture was used in a connected fitness application. The application processes inputs from one or more sensors (smartwatch, HR sensor, smart clothes) to track fitness regimes and to deliver targeted health and fitness advice to the users. 
+
+The application on the user's smartphone connects data from the available sensors, combines it with a statistical model of the user's behaviour, and---where available---fine-grained location services. These three inputs allow the application to make the first distinction: exercise vs. no-exercise. From the user's perspective, the system is an automated fitness trainer; from a data scientist's perspective, the biometric data the system collects allows for detailed analysis of exercises, exercise regimes, impact of exercise on the users' well-being, automated physiotherapy, and many other applications.
+
+\subsection{Main components}
+
+\fig{ri-arch.png}{components}{Components}
+
+The sensors shown here as consumer-grade wearables perform only the basic hardware interaction: there is no pre-processing of the recorded data. The system accepts accelerometer, gyroscope, heart rate and---where available---data from strain gauges in smart clothes. The mobile application performs the real-time processing of the inputs, displays the next exercise the user should perform (allowing the user to change the suggestion by simply walking to a station for a different exercise, or by beginning a different exercise). The mobile application also prompts the user to confirm correct labels for the recorded data. \emph{This is the key component in the entire system: the frictionless user experience gives the system very accurate labels on very clean data}.
+
+The mobile submits the entire session data (the sensor data, matching labels and latest user behaviour models) in a single request to the Akka \cite{akka} cluster---a CQRS/ES \cite{cqrs-es} microservice implementation. The Akka cluster stores its events and snapshots in a journal, implemented by the Apache Cassandra \cite{apache-cassandra} database. Alongside the events and snapshots, which are opaque to non-Akka systems, the \emph{sensor data} microservice saves the sensor data and the matching labels in a properly formed tabular structure. This structure allows the Apache Spark \cite{apache-spark} cluster to be used for typical big data tasks. An important consideration is privacy and security of the data: the system does not use stable identifiers for the biometric data. This is similar to the unstable advertising identifier used in, for example, the iOS devices \cite{ios-advertising-identifier}. The unstable \emph{biometric identifier} can be refreshed at arbitrary points in time; for very sensitive applications (e.g. clinical physiotherapy), we refresh the biometric identifier after each session; for typical consumer scenarios, we give the users the option to refresh the biometric identifier.
+
+The Apache Spark cluster reads the fitness profiles (associated with the unstable biometric identifier) and computes clusters of users by examining the values in the fitness profile. Even though the profile information holds self-reported data, the data we store include age bracket ($\interval[open]{18}{25}$, $\interval[open]{25}{35}$, $\interval[open]{35}{45}$, ..., $\interval[open]{75}{\inf}$), sex, self-reported fitness level (beginner, intermediate, enthusiast, athlete), self-reported weight and self-reported height.
+
+Once we have the biometric identifiers for each cluster, we read the sensor data, together with the single-session and all-sessions metadata, and find:
+
+\begin{itemize}
+\item The Markov chain of exercise sessions that results in greatest improvement (where improvement may be muscle mass gain, fat loss, and \emph{hapiness}.)
+\item The Markov chain of exercises in a session that results in greatest improvement (where improvement may be muscle mass gain, fat loss, and \emph{hapiness}.)
+\item The most and least popular exercises
+\end{itemize}
+
+The output of these \emph{big data} tasks is written back to the Apache Cassandra database; the Akka cluster reads the exercise-related output to provide advice back to the users; the machine learning training and evaluation programs reads the sensor-data related output to compute new models to recognise the exercises.
+
+The models to predict exercise from sensor data are implemented in a cluster of keras \cite{keras} training and evaluation programs. These programs read the sensor data for each cluster, expand the sensor data to each combination of sensors, then train the most successful convolutional neural networks identified through random evolution of previous training executions. (The first execution is human-defined, starting with a three-layer network.) For every sensor data split and every cluster, the training program selects $n$ most successful CNN hyper-parameters from the previous runs, then divides the data into training and test datasets. It then randomly mutates $m$ ($m << n$) CNNs before fitting each CNN to the testing data. The evaluation program then evaluates all new $n$ CNNs, keeping only the most successful ones (defined by the evaluation's F1 score).
+
+The models' hyper-parameters, parameters and evaluation scores are written back to the database. The Akka cluster then selects the best model (hyper-parameters and parameters) and uses the Apple content delivery network to push it to the users with the matching biometric identifiers. (This enables the Akka cluster to concentrate on its primary task: sensor data ingestion, leaving all other data manipulation and transfer tasks to external services while maintaining frictionless user experience.)
+
+The sensors send the data in \SI{1}{\second} batches; the application on the mobile resamples the sampling rate to \SI{50}\hertz. (Accelerometer and gyroscope typically sample at this rate, heart rate and the strain gauges in smart clothes can be up-sampled to \SI{50}{\hertz} easily.) The mobile application ingests the data from the sensors and, together with a statistical model of the user's short-term behaviour, attempts to identify the movement. The models in the mobile application can make successful predictions of sequence of exercises in a session and the properties of each exercise (i.e. weight, number of repetitions, duration, intensity). The model used to predict sequence of exercise sessions and exercises within a session is a Markov chain \cite{markov-chain-exercise}. This approach allows the application to deal with the reality of exercise in a public gym, where the station for the next suggested exercise might not be available. The Markov chain, together with a bio-mechanical model of the main muscle groups, gives the users the flexibility to achieve their workout targets even in crowded gyms. The sequence of exercise predictions for one particular exercise sessions are illustrated on \autoref{fig:model-sequence}.
+
+\fig{ri-model-sequence.png}{model-sequence}{Exercise sequence model with no context}
+
+The numbers in \autoref{fig:model-sequence} represent the count of transitions taken; hence it is possible to calculate the probability of transition from any given state. The state names represent the exercise labels, in real application, they are the real exercise names. The mobile application can either receive the chain when the user selects one of the pre-defined exercise programmes, or it can construct the chain from empty if the user choses to start his or her custom workout. This gives the application an intuitive feel; its suggestions are what the users usually do. Finally, the information in the chain allows the system to identify the most popular sequences of exercises, to identify exercises that the users do not like; more interestingly, the system can use the information in the chain to identify sequence of exercises that leads to the best improvement. (At this point, we do not define what the improvement is: in some applications, it may be weight loss; in other applications, it may be greatest mobility range improvement; and many others.)
+
+To make the next-exercise prediction more accurate, the mobile application uses fined-grained location services. The location services are implemented using bluetooth beacons. The beacons operate in the iBeacon mode \cite{ibeacon}; each beacon in this mode transmits its identifier, a major, and minor values. The mobile application sets up continuous scanning of a major value which identifies exercise equipment, receiving notifications of beacons and their minor values as they come into range. The mobile application then filters the exercise states keeping only those that are associated with a particular area. (Viz \autoref{fig:model-sequence+location}.)
+
+\fig{ri-model-sequence+location.png}{model-sequence+location}{Exercise sequence model with location context}
+
+With the fine-grained location data available, the application is \emph{expecting} to see a movement that precedes exercises A or C. We call this movement the \emph{setup movement}. The setup movement classifier is a multi-layer perceptron, which takes \SI{1}\second of sensor input and produces probabilities classes that represent the setup movement for groups of exercises. The hyper-parameters of the MLP is driven by the sensor data as its inputs; for example, accelerometer-only MLP has 150 inputs (50 samples of the acceleration vector) and as many outputs as the number of recognised setup movements. It is important to measure and optimise the power requirements for the computation; on iOS, we took advantage of the vDSP and veclib frameworks, which offer optimised vector operations. The MLP classes are not the exercises themselves, but the setup movements; one setup movement can map to multiple exercises. To provide accurate prediction of the exercise about to be started, the mobile application takes into account the expected exercise (given the user's typical behaviour), and the fine-grained location data. The performance of the exercise prediction for accelerometer on the user's wrist is shown in \autoref{tbl:setup-movement-performance-accelerometer}; the performance of the exercise prediction rises significantly in fully-wired human (viz \autoref{tbl:setup-movement-performance-all}).
+
+\begin{table}[h]
+\caption{Exercise prediction performance (accelerometer)}
+\label{tbl:setup-movement-performance-accelerometer}
+\begin{center}
+\begin{tabular}{|l||m{1cm}|m{1cm}|m{1cm}|m{1cm}|}
+\hline                      & Accuracy & Precision & Recall & F1 \\
+\hline No context           & !!       & !!        & !!     & !! \\
+\hline Behaviour            & !!       & !!        & !!     & !! \\ 
+\hline Behaviour, location  & !!       & !!        & !!     & !! \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{table}[h]
+\caption{Exercise prediction performance (all sensors)}
+\label{tbl:setup-movement-performance-all}
+\begin{center}
+\begin{tabular}{|l||m{1cm}|m{1cm}|m{1cm}|m{1cm}|}
+\hline                      & Accuracy & Precision & Recall & F1 \\
+\hline No context           & !!       & !!        & !!     & !! \\
+\hline Behaviour            & !!       & !!        & !!     & !! \\ 
+\hline Behaviour, location  & !!       & !!        & !!     & !! \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+Finally, the mobile application asks the user to confirm the label for the collected sensor data. Given the good performance of the exercise recognition (particularly when using fine-grained location services), this is typically just a \emph{confirm} step rather than complex data entry exercise. The mobile application builds a local store of the time regions of labelled sensor data. This store, together with the Markov chain representing the exercise sequence and the final feedback (happy, indifferent, unhappy) is submitted to the server. The server decompresses \& decodes the submitted data and stores it in tabular form in Apache Cassandra, referencing the user's biometric ID. 
+
+\subsection{Mobile and wearables}
+
+The mobile application is an iOS only app at the moment; the consumer-grade wearable companions are a watchOS app and a Pebble (aplite, basalt, and chalk) flavours. The wearables send the data to the mobile application over BLE. The protocol as well as the hardware architecture of the devices places restrictions on the sample width and sampling rate. BLE protocol specifies maximum \SI{80}{\byte} per message, and minimum duration of \SI{7.5}{\milli\second} between messages; this gives us theoretical maximum of \SI{10640}{\byte\per\second}. With one particular hardware / firmware implementation, we found that the effective reliable data transfer rate drops to only \SI{280}{\byte\per\second}. That particular device also lacked significant processing power. This gave us baseline protocol for samples with 3 axes (such as acceleration or rotation), with \SI{20}{\byte} for header and \SI{5}{\byte} per sample. The lack of processing power meant that we could not implement any reasonable compression algorithm. Instead, we took into account maximum reasonable acceleration a human can achieve in exercise, \SI{40}{\meter\second^{-2}}, and represented sample as $3 \times$\SI{13}{\bit} for $x$, $y$, and $z$ axes (with \SI{1}{\bit} for padding). Along with the samples, the wearable sends its timestamp, which is a monotonously-increasing device time in milliseconds. The mobile application remembers the first seen timestamp from each sensor for each exercise session, and uses this value to properly align the samples from the sensors. The sensor data includes quantisation error: at \SI{50}{\hertz} one sample represents \SI{20}{\milli\second} of real-time, but the difference of the timestamps may not be divisible by $20$. We found that it is sufficient to perform `round-even' correction of the received samples by evenly removing or duplicating the last sample in case of detected quantisation errors\footnote{Without the quantisation error correction, together with the unreliable sensors, the time error can add up to \SI{10}{\seconds} per hour of exercise}.
+
+Because the consumer-grade sensors often do not have enough processing and communication power to collect \& transmit the data without errors, the mobile application also has to pad missing values from the sensors in order to remain responsive and to be able to provide a full set of sensor values for subsequent processing. We found that for gaps less than \SI{200}{\milli\second}, it is sufficient to extrapolate the samples linearly between the sides of the gap regardless of sensor type. Longer gaps require special treatment in case of accelerometer, gyroscope: in these cases, the application uses the Kalman filter assuming constant acceleration of \SI{10}{\meter\second^{-2}} to extrapolate the values between the sides of the gap. The heart rate sensor does not suffer significant loss of accuracy for gaps up to \SI{15}{\second}. Once the sensor data from all sensors has been fused with respect to the sample time, the mobile application performs very simple pre-processing by smoothing the input signal by convolving it with a $3 \times 3$ matrix.
+
+Finally, the sensor data in the mobile application is a set of vectors containing 1 second of sensor input data, normalised to a range of $\interval[open]{-1}{1}$ by using a maximum reasonable value for acceleration, rotation, strain and heart rate. The maximum values are determined by the limitations of the sensor hardware together with reasonable limitations of human movement and together with the ranges of the protocol. For the three-value protocol used for the accelerometer and gyroscope data, and for the strain sensors, the limit of each element is the range of signed \SI{13}{\bit} integer: $\interval[open]{-4096}{4095}$. The unit of the measurement depends on the underlying sensor type: $0.01\ ms^{-2}$ for accelerometer, \SI{\pi/1800}{\radian\per\second} for gyroscope, and so on.
+
+The fused and normalised sensor data is then passed as a single vector to the inputs of the CNN that matches the types of sensor inputs, and its outputs are the classes of setup movements. It is important to measure and optimise the power requirements for the computation; on iOS, we took advantage of the vDSP and veclib frameworks, which offer optimised vector operations. As the classes are not the exercises themselves, but the setup movements; one setup movement can map to multiple exercises. To provide accurate prediction of the exercise about to be started, the mobile application takes into account the expected exercise (given the user's typical behaviour), and the fine-grained location data. 
+
+The result on \autoref{fig:ri-mobile-ui} is---what we believe---an application which successfully guides users through their exercise programmes, adapts to changes, encourages improvements; all with \emph{minimal interaction during the exercise session}. 
+
+\fig{ri-mobile-ui.png}{ri-mobile-ui}{Mobile UI}
+
+The mobile application records all received sensor data locally; however, it only transmits the blocks labelled as exercise to the server. The local storage allows us to handle the device being offline (or simply a situation where the user does not want to use his or her data allowance). \autoref{fig:ri-mobile-dm} shows the data model; notice the \lstinlinex{sensorData} attribute in \lstinlinex{MRManagedExerciseSession}, which holds all data recieved from all sensors; the \lstinlinex{MRManagedExercise} with at least one \lstinlinex{MRManagedExerciseScalarLabel} then represent labelled time slices of the \lstinlinex{sensorData}. A compact representation (Protobuf \cite{protobuf}) of the \lstinlinex{MRManagedExerciseSession} is submitted to the server for further processing.
+
+\fig{ri-mobile-dm.png}{ri-mobile-dm}{Mobile data model}
+
+\subsection{Server components}
+
+The Akka cluster is a CQRS/ES system, which exposes REST APIs for the mobile application. The REST requests it receives are treated as commands; once a command is validated, the code in the cluster turns it into an \emph{event} and persists it in the journal. Later on, another component may represent the system's state as the sum of all the events in the journal. This \emph{command / query responsibility separation} approach makes it possible to efficiently distribute the processing required by the system's components. (For example, if the users often request a view of the state of the system, then the \emph{query} components receive more resources.) The Akka toolkit uses Actor-based concurrency: within an actor, all computation is synchronous; the toolkit handles asynchronous communication between actors. This allows us to maintain clear boundary on any mutable state: if is kept within an actor, it is safe. 
+
+Internally, there are two main kinds of microservice: one that does not use or need clustering or cluster sharding, and one that does. The example of clustered microservice is the \emph{user profile} microservice; its state is all user profiles, which would not fit in a single node. And so, it needs to be clustered over multiple nodes, with all the complexity of routing the requests to the right actors, cluster rebalancing \& error recovery. The \emph{sensor data} microservice is not clustered: the nodes that comprise it do not need to know about each other; each node is completely stateless, therefore requests arriving at the microservice can be routed to any node. \autoref{fig:ri-akka-actors} shows the two microservices.
+
+\fig{ri-akka-actors.png}{ri-akka-actors}{Akka REST API and actors}
+
+In the Lightbend stack parlance, the \emph{service} is the name for the interface (in this case, the REST API; the \lstinlinex{ProfileService} and \lstinlinex{SensorDataService}). It processes the HTTP requests, turning them into messages, which are then delivered to the underlying actors. In case of the \emph{sensor data} service, the actor decodes the sensor data payload and persists it in the sesor data database. In case of the \emph{user profile} service---a CQRS/ES microservice---the HTTP request is processed in the same way, turning it into a \emph{command} message. This command is sent to the \lstinlinex{UserProfileProcessor}, which validates the command and turns it into an \emph{event}. In the CQRS/ES world, we say that an event event is never lost and it will be processed at some point by the \lstinlinex{UserProfile} view. The processor is typically stateless with respect to the commands; the views typically hold state, which is the result of processing all events.
+
+The separation of command and query processing code allows the system to scale selectively: profile views are more frequent than views; the combination of supervision in Akka and persistence in actors allows the system to scale up and down, and to handle errors gracefully.\footnote{There are many topics that we have not covered, especially around message delivery semantics in distributed systems.}
+
+\subsection{Apache Spark batch analytics}
+
+Vivamus urna velit, volutpat ut tincidunt sit amet, pulvinar vitae est. Nam tortor sapien, sagittis non luctus sit amet, porttitor a purus. Donec mattis blandit bibendum. Morbi ipsum lacus, gravida ut nibh semper, porta tincidunt ex. Sed tellus lectus, posuere in facilisis quis, suscipit eu tortor. Maecenas sagittis diam non orci scelerisque, vehicula rutrum ipsum elementum. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Proin bibendum justo gravida sem accumsan consequat. Nunc tristique aliquam magna, id convallis tellus gravida et. Sed orci est, tempus eu ligula sed, posuere feugiat nunc. Sed est mauris, dignissim dignissim pretium in, elementum a neque. Phasellus mollis sollicitudin justo, ut commodo turpis volutpat in. Fusce egestas nunc dui, vel mollis tellus interdum vel. Donec porttitor lorem non mauris porttitor, euismod vestibulum nisi tincidunt. Nunc fringilla risus nulla, id vulputate sem blandit ut. Proin est mauris, viverra in interdum quis, fringilla at augue.
+
+Vivamus urna velit, volutpat ut tincidunt sit amet, pulvinar vitae est. Nam tortor sapien, sagittis non luctus sit amet, porttitor a purus. Donec mattis blandit bibendum. Morbi ipsum lacus, gravida ut nibh semper, porta tincidunt ex. Sed tellus lectus, posuere in facilisis quis, suscipit eu tortor. Maecenas sagittis diam non orci scelerisque, vehicula rutrum ipsum elementum. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Proin bibendum justo gravida sem accumsan consequat. Nunc tristique aliquam magna, id convallis tellus gravida et. Sed orci est, tempus eu ligula sed, posuere feugiat nunc. Sed est mauris, dignissim dignissim pretium in, elementum a neque. Phasellus mollis sollicitudin justo, ut commodo turpis volutpat in. Fusce egestas nunc dui, vel mollis tellus interdum vel. Donec porttitor lorem non mauris porttitor, euismod vestibulum nisi tincidunt. Nunc fringilla risus nulla, id vulputate sem blandit ut. Proin est mauris, viverra in interdum quis, fringilla at augue.
+
+Vivamus urna velit, volutpat ut tincidunt sit amet, pulvinar vitae est. Nam tortor sapien, sagittis non luctus sit amet, porttitor a purus. Donec mattis blandit bibendum. Morbi ipsum lacus, gravida ut nibh semper, porta tincidunt ex. Sed tellus lectus, posuere in facilisis quis, suscipit eu tortor. Maecenas sagittis diam non orci scelerisque, vehicula rutrum ipsum elementum. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Proin bibendum justo gravida sem accumsan consequat. Nunc tristique aliquam magna, id convallis tellus gravida et. Sed orci est, tempus eu ligula sed, posuere feugiat nunc. Sed est mauris, dignissim dignissim pretium in, elementum a neque. Phasellus mollis sollicitudin justo, ut commodo turpis volutpat in. Fusce egestas nunc dui, vel mollis tellus interdum vel. Donec porttitor lorem non mauris porttitor, euismod vestibulum nisi tincidunt. Nunc fringilla risus nulla, id vulputate sem blandit ut. Proin est mauris, viverra in interdum quis, fringilla at augue.
+
+\subsection{Machine learning}
+
+The ML training and evaluation programs use Python and run in Docker containers. To support fast development cycle, we build two flavours of Docker images: a \emph{light} image that can run on nearly any underlying hardware, and a CUDA \cite{cuda} image that runs on the EC2 \lstinlinex{g2.2xlarge} instance. The latest development work uses Deeplearning4j \cite{dl4j} in order to standardise the infrastructure; the improvements in the underlying numerical library implementation (Nd4j) for both CPUs and GPUs should allow us to move from the Python / Theanu implementation to a JVM-based one. This will simplify our infrastructure, even though the model computation can execute on a single node; the paralelisation is achieved through running multiple nodes. Regardless of the underlying implementation, the machine learning microservice performs the following loop:
+
+\begin{itemize}
+\item Generate new model hyperparameters by appending randomly mutated hyperparameters to the current set of hyperparameters,
+\item For each model hyperparameters, construct a model and fit the training dataset,
+\item Measure the fitted model's performance using the test dataset,
+\item Save the measured performance and hyperparameters
+\end{itemize}
+
+The hyperparameter mutating code is fairly basic at the moment; it can only
+
+\begin{itemize}
+\item Mutate dense layer's activation functions
+\item Mutate dropout layer's rate
+\item Mutate convolution layer's kernel
+\item Remove or add layer
+\item Mutate learning rate, momentum and and decay of the SGD optimiser
+\end{itemize}
+
+Notice also that our evolution code is purely random; there is no optimiser. This code does produce well-performing models, though \emph{its energy or cost efficiency is extremely poor}. \autoref{fig:ri-model-evolution} illustrates this process for 2 models hyperparameters.
+
+\fig{ri-model-evolution.png}{ri-model-evolution}{Model evolution}
+
+The final consideration is the sensor data explosion: this is something that we actually need in our system to be able to make as much of the collected data as possible. While most users wear only a single smartwatch (which gives us accelerometer data from one wrist), there are some users who wear many more sensors. What we call a \emph{fully-wired human} wears accelerometer and gyroscope on the wirst, together heart rate monitor and sports clothes that contain strain gauges along major muscle groups. This gives us (at the moment) 2 data points from the wrist, 1 from the heart rate sensor (we drop down to simple heart rate, we do not measure the full ECG traces), and \emph{20 data points from the muscle groups}. Just under \SI{50}{\percent} of our users fall somewhere between the smartwatch-only and fully-wired categories. To ensure that we make the most of every user, the training program needs to expand the recorded data into all known sensor combinations. So, for a dataset with $n$ sensors, we expand it into $\binom nn + \binom n{n-1} + \binom n{n-2} + ... + \binom n1$ datasets, as illustrated on \autoref{fig:ri-sensor-explosion}. 
+
+\fig{ri-sensor-explosion.png}{ri-sensor-explosion}{Sensor explosion}
+
+The processing code maintains a predetermined ordering of the sensor samples to column vectors to the dataset\footnote{This ordering code is shared between the ML module and the mobile application. The back- as well as the forward-propagation constructs the input vector from the expanded (or available, in case of the mobile code) sensor data.}. The ML microservice persists the model hyperparameters, parameters, evaluation results, the required sensor inputs, and a mapping to the cluster of biometric IDs into the database cluster.
+
+The mobile application checks for updates to the best model (hyperparameters, parameters and the required sensor inputs); if a new model is available, it prompts the user to download it. (Future versions may support paid-for models through the non-consumable in-app purchase model; in this scenario, the Akka cluster is responsible for delivering the updated non-consumable content to Apple in order to make it available to the users who have in-app purchased it.)
+
+\section{Server infrastructure}
+
+To run the system's server components, a modern cluster management \& distributed init system abstracting over a fault-tolerant, self-healing infrastructure is needed. In our case, a highly available Mesos \cite{mesos} cluster provides abstraction at the datacentre level and acts as a datacentre-wide resource manager. To achieve faster deployments, the microservices that comprise the system are packaged as Docker \cite{docker} images. The build system (Jenkins \cite{jenkins}) starts by building the Docker images. These images are deployed and managed using a scheduler (Marathon \cite{marathon}) which acts as the distributed init system and the process manager. Marathon is used for long-running jobs such as the microservices, and the database cluster; Chronos \cite{chronos} is used to manage the short-lived jobs (e.g. the batching Apache Spark jobs). Having Marathon and Chronos job configurations in git allows for any changes to infrastructure to be versioned, traceable and auditable. Job configuration changes are synchronised to a distributed key-value store (Consul \cite{consul}). When a job configuration changes, the Consul handler uses the scheduler API (Marathon REST API) to trigger the infrastructure update through the cluster OS (Mesos). Finally, the cluster OS metrics and the list of running services from the service registry provide the information for the dynamic scaling code.
+This infrastructure allowed us to implement and maintain a robust and reliable production system. \autoref{fig:ri-infrastructure} illustrates the outline of our cloud-based infrastructure and highlights the workflow of putting code to production.
+
+\fig{ri-infrastructure.png}{ri-infrastructure}{Infrastructure}
+
+There are many more topics that we could not describe here: rolling upgrades without message loss, zero downtime deployment, message versioning, API versioning, message integrity verification, detailed privacy and security concerns, wire formats, cluster consistencies, reliable multi-region and global implementations, test and training data management, model evolution, centralized logging, back pressure reporting and handling, and many more. 
+
+\section{Further research}
+
+The current system is a great starting point for future work. We are actively pursuing three avenues; we will publish our results as soon as we are ready.
+
+\subsection{Removing self-reporting from activity and food tracking}
+
+We are also very excited to use this work as a basis for a Horizon 2020 \cite{horizon2020} project proposal; the aim of the Horizon 2020 project is to help as many people as possible to help become more active, while at the same time preventing injury and to assist with weight management. The problems with most weight management programmes center around self-reporting, where the users (sometimes grossly) over-estimate the amount and intensity of exercise performed and (sometimes grossly) under-estimate the amount of food consumed. \cite{!!!}. We can tackle the exercise over-reporting using this system. Understanding what users eat is much more difficult; one of the avenues we are exploring is tracking the amount of food \emph{purchased}. We understand that this is not equal to the amount of food consumed, but we believe we can draw sensible correlations, particularly when comparing large volumes of users, their exercise habits and the details of purchased food. (We are using Mondo \cite{mondo} for food purchase tracking PoC.)
+
+\subsection{Quality of exercise}
+
+One of the approaches we explored for measuring quality of exercise \emph{in laboratory conditions} was to use LDLf \cite{ldlf}, where we use a CNN to identify short-duration events in the stream of fused sensor data; we then run LDLf queries over the stream of events, satisfiable queries produce events about the exercise being performed. However, at the moment of writing, we have only implemented this approach in the Akka cluster; the network latency in delivering the sensor data from the sensors through the mobile application to the Akka cluster, evaluating the stream and sending the results back to the mobile is far too great (in the order of units of seconds) to be usable. \autoref{fig:ri-ldlf-stream} illustrates the processing pipeline we used.
+
+\fig{ri-ldlf-stream.png}{ri-ldlf-stream}{LDLf stream processing}
+
+The input from the sensors (\emph{SensorNet}) is split into windows (\emph{SensorNetValue}); the sensor data in the windows is classified using CNNs similar to the one use in the current implementation of the mobile application (\emph{BindToSensors}). The \emph{BindToSensors} and the LDLf formul\ae\ then evaluate the stream of events, and together with a state machine which represents particular exercises or exercise regimes, the system can identify sequences of inputs from sensors, which together not only identify, but also express \emph{quality} of exercise being performed. Unfortunately, we were not yet able to implement user-friendly learning mechanism; the classifiers and formul\ae\ are currently hand-crafted. This proves the implementation in principle, but leaves a lot of work for the final product.
+
+\subsection{Innovative UX}
+
+Further research will focus on the system's human interaction. Interacting with a screen while exercising greatly reduces the effort the users put in \cite{!!!}; however, listening to music often has the opposite effect \cite{!!!}. Therefore, our future research will explore conversational interfaces delivered through voice synthethiser. 
+
+
+\section{Summary}
+
+The focus of our work is on guiding the user during his or her exercise or physiotherapy session; to do that, it is necessary to indicate to the user \emph{what to do next} and to recognise that the exercise is actually being performed, and to give feedback about the exercise being performed, as early as possible. In our testing, we found that delays of more than \SI{1}{\second} confuse the users. It was not possible to use the work in \cite{morris:2014ir}; instead, we needed to build our own probabilistic model of next exercise and then eager sensor data recognition layer. It is equally important to accurately collect labelled data, this is achieved through frictionless user interface. The labelled sensor data, the exercise sequences, and the feedback data is written---together with the matching unstable biometric ID and associated profile---to a Apache Cassandra database in normal tabular form. The Apache Spark jobs then identify clusters of biometric IDs based on the information in the profiles, together with (per cluster) the best sequence of exercises and the best sequence of exercise sessions, the top $n$ user-contributed exercises.
+
+\addtolength{\textheight}{-12cm}  % This command serves to balance the column lengths
+                                  % on the last page of the document manually. It shortens
+                                  % the textheight of the last page by a suitable amount.
+                                  % This command does not take effect until the next page
+                                  % so it should come on the page before the last. Make
+                                  % sure that you do not shorten the textheight too much.
+
+\begin{thebibliography}{99}
+
+\bibitem{markov-chain-exercise} F. Oo, Q. Uux. Bar. 2016.
+\bibitem{akka} Akka.
+\bibitem{cqrs-es} CQRS/ES.
+\bibitem{apache-cassandra} Apache Cassandra.
+\bibitem{apache-spark} Apache Spark.
+\bibitem{ibeacon} iBeacon.
+\bibitem{ios-advertising-identifier} iOS advertising identifier.
+\bibitem{keras} keras.
+\bibitem{mesos} Mesos.
+\bibitem{jenkins} Jenkins.
+\bibitem{marathon} Marathon.
+\bibitem{docker} Docker.
+\bibitem{chronos} Chronos.
+\bibitem{protobuf} Protobuf.
+\bibitem{consul} Consul.
+\bibitem{dl4j} DL4J.
+\bibitem{horizon2020} European Commission. Horizon 2020. https://ec.europa.eu/programmes/horizon2020/. 28 May 2016.
+\bibitem{mondo} Mondo.
+\bibitem{cuda} CUDA.
+\bibitem{morris:2014ir} Morris, D., Saponas, T. S., Guillory, A., \& Kelner, I. (2014). RecoFit (pp. 3225--3234). Presented at the the 32nd annual ACM conference, New York, New York, USA: ACM Press. http://doi.org/10.1145/2556288.2557116
+\bibitem{ldlf} LTLf and LDLf Monitoring. Giuseppe De Giacomo, Riccardo De Masellis, Marco Grasso, Fabrizio Maria Maggi and Marco Montali, 2014
+
+\end{thebibliography}
+
+
+\end{document}
